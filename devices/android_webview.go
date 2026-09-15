@@ -245,34 +245,33 @@ func (d *AndroidDevice) attachAgentAndWait(pkg string, port int, agentDir string
 	return nil
 }
 
-// getWebViewPort resolves the foreground app and ensures the agent is ready,
-// returning the local TCP port to use for RPC calls.
-func (d *AndroidDevice) getWebViewPort() (int, error) {
-	// Foreground detection can momentarily fail right after a launch or in-app
-	// navigation — mCurrentFocus is briefly null during the window transition —
-	// so retry for a short while instead of failing on the first miss.
-	var foreground *ForegroundAppInfo
-	var err error
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		foreground, err = d.GetForegroundApp()
-		if err == nil {
-			break
-		}
-		if time.Now().After(deadline) {
-			return 0, fmt.Errorf("could not determine foreground app: %w", err)
-		}
-		time.Sleep(150 * time.Millisecond)
-	}
-	return d.ensureAgentReady(foreground.PackageName)
+// webViewBackend abstracts how webview operations reach the page. A debug build
+// is driven through the injected JVMTI agent; a release build has no agent route
+// (it needs run-as) and is driven over the DevTools protocol instead.
+type webViewBackend interface {
+	list() ([]WebViewInfo, error)
+	goTo(webviewID, url string) error
+	reload(webviewID string) error
+	goBack(webviewID string) error
+	goForward(webviewID string) error
+	evaluate(webviewID, expression string, args []any) (any, error)
+	waitForLoadState(webviewID, state string, timeoutMs int) error
+
+	// healthy reports whether this transport still reaches the app. It is part of the
+	// interface rather than an optional assertion so that a new backend cannot silently
+	// omit it and be cached forever across an app restart.
+	healthy() bool
 }
 
-func (d *AndroidDevice) ListWebViews() ([]WebViewInfo, error) {
-	port, err := d.getWebViewPort()
-	if err != nil {
-		return nil, err
-	}
-	result, err := agentRequest(port, "device.webview.list", nil)
+// agentParamURL is the agent's own JSON-RPC parameter name. It is deliberately not
+// shared with the CDP constant of the same value: renaming one must not change the other.
+const agentParamURL = "url"
+
+// agentBackend drives webviews through the injected in-process agent.
+type agentBackend struct{ port int }
+
+func (a agentBackend) list() ([]WebViewInfo, error) {
+	result, err := agentRequest(a.port, "device.webview.list", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -283,40 +282,137 @@ func (d *AndroidDevice) ListWebViews() ([]WebViewInfo, error) {
 	return webviews, nil
 }
 
+func (a agentBackend) goTo(webviewID, url string) error {
+	_, err := agentRequest(a.port, "device.webview.goto", map[string]any{"id": webviewID, agentParamURL: url})
+	return err
+}
+
+func (a agentBackend) reload(webviewID string) error {
+	_, err := agentRequest(a.port, "device.webview.reload", map[string]any{"id": webviewID})
+	return err
+}
+
+func (a agentBackend) goBack(webviewID string) error {
+	_, err := agentRequest(a.port, "device.webview.goBack", map[string]any{"id": webviewID})
+	return err
+}
+
+func (a agentBackend) goForward(webviewID string) error {
+	_, err := agentRequest(a.port, "device.webview.goForward", map[string]any{"id": webviewID})
+	return err
+}
+
+func (a agentBackend) evaluate(webviewID, expression string, args []any) (any, error) {
+	return webViewEvaluate(a.port, webviewID, expression, args)
+}
+
+func (a agentBackend) waitForLoadState(webviewID, state string, timeoutMs int) error {
+	return webViewWaitForLoadState(a.port, webviewID, state, timeoutMs)
+}
+
+// healthy reports whether the injected agent is still answering. Without it a cached
+// backend would outlive the process it was attached to: the app restarts, the adb
+// forward survives with nothing behind it, and every later call fails. Re-resolving
+// instead re-attaches the agent, which is what the uncached code did on every call.
+func (a agentBackend) healthy() bool {
+	return isAgentReady(a.port)
+}
+
+// foregroundPackage resolves the package currently in front.
+func (d *AndroidDevice) foregroundPackage() (string, error) {
+	// Foreground detection can momentarily fail right after a launch or in-app
+	// navigation — mCurrentFocus is briefly null during the window transition —
+	// so retry for a short while instead of failing on the first miss.
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		foreground, err := d.GetForegroundApp()
+		if err == nil {
+			return foreground.PackageName, nil
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("could not determine foreground app: %w", err)
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
+// resolveWebViewBackend picks a transport for the foreground app, preferring the
+// agent (it resolves webviews by their native view identity) and falling back to
+// DevTools when the app is not debuggable.
+func (d *AndroidDevice) resolveWebViewBackend() (webViewBackend, error) {
+	// Resolving and superseding must be atomic: with the lookup outside the lock, one
+	// goroutine could close a backend that another is actively using.
+	d.webViewMu.Lock()
+	defer d.webViewMu.Unlock()
+
+	pkg, err := d.foregroundPackage()
+	if err != nil {
+		return nil, err
+	}
+	if d.webViewBackend != nil && d.webViewPkg == pkg && d.webViewBackend.healthy() {
+		return d.webViewBackend, nil
+	}
+
+	// a superseded backend must not keep its websockets open
+	if old, ok := d.webViewBackend.(*cdpBackend); ok {
+		old.close()
+	}
+	d.webViewBackend = nil
+
+	port, agentErr := d.ensureAgentReady(pkg)
+	if agentErr == nil {
+		d.webViewPkg, d.webViewBackend = pkg, agentBackend{port: port}
+		return d.webViewBackend, nil
+	}
+
+	cdpPort, cdpErr := d.ensureCDPForward(pkg)
+	if cdpErr == nil {
+		d.webViewPkg, d.webViewBackend = pkg, &cdpBackend{port: cdpPort, bundleID: pkg}
+		return d.webViewBackend, nil
+	}
+
+	return nil, fmt.Errorf("no webview transport available for %s:\n  agent injection: %v\n  devtools: %v",
+		pkg, agentErr, cdpErr)
+}
+
+func (d *AndroidDevice) ListWebViews() ([]WebViewInfo, error) {
+	backend, err := d.resolveWebViewBackend()
+	if err != nil {
+		return nil, err
+	}
+	return backend.list()
+}
+
 func (d *AndroidDevice) WebViewGoto(webviewID, url string) error {
-	port, err := d.getWebViewPort()
+	backend, err := d.resolveWebViewBackend()
 	if err != nil {
 		return err
 	}
-	_, err = agentRequest(port, "device.webview.goto", map[string]any{"id": webviewID, "url": url})
-	return err
+	return backend.goTo(webviewID, url)
 }
 
 func (d *AndroidDevice) WebViewReload(webviewID string) error {
-	port, err := d.getWebViewPort()
+	backend, err := d.resolveWebViewBackend()
 	if err != nil {
 		return err
 	}
-	_, err = agentRequest(port, "device.webview.reload", map[string]any{"id": webviewID})
-	return err
+	return backend.reload(webviewID)
 }
 
 func (d *AndroidDevice) WebViewGoBack(webviewID string) error {
-	port, err := d.getWebViewPort()
+	backend, err := d.resolveWebViewBackend()
 	if err != nil {
 		return err
 	}
-	_, err = agentRequest(port, "device.webview.goBack", map[string]any{"id": webviewID})
-	return err
+	return backend.goBack(webviewID)
 }
 
 func (d *AndroidDevice) WebViewGoForward(webviewID string) error {
-	port, err := d.getWebViewPort()
+	backend, err := d.resolveWebViewBackend()
 	if err != nil {
 		return err
 	}
-	_, err = agentRequest(port, "device.webview.goForward", map[string]any{"id": webviewID})
-	return err
+	return backend.goForward(webviewID)
 }
 
 func (d *AndroidDevice) WebViewContent(webviewID string) (string, error) {
@@ -332,17 +428,17 @@ func (d *AndroidDevice) WebViewContent(webviewID string) (string, error) {
 }
 
 func (d *AndroidDevice) WebViewEvaluate(webviewID, expression string, args []any) (any, error) {
-	port, err := d.getWebViewPort()
+	backend, err := d.resolveWebViewBackend()
 	if err != nil {
 		return nil, err
 	}
-	return webViewEvaluate(port, webviewID, expression, args)
+	return backend.evaluate(webviewID, expression, args)
 }
 
 func (d *AndroidDevice) WebViewWaitForLoadState(webviewID, state string, timeoutMs int) error {
-	port, err := d.getWebViewPort()
+	backend, err := d.resolveWebViewBackend()
 	if err != nil {
 		return err
 	}
-	return webViewWaitForLoadState(port, webviewID, state, timeoutMs)
+	return backend.waitForLoadState(webviewID, state, timeoutMs)
 }

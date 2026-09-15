@@ -101,6 +101,12 @@ type AndroidDevice struct {
 	// host port of the DeviceServer once it's known to be up and current
 	serverMu   sync.Mutex
 	serverPort int
+
+	// webview transport for the current foreground app, kept between calls so a
+	// CDP session is dialed once rather than per operation
+	webViewMu      sync.Mutex
+	webViewPkg     string
+	webViewBackend webViewBackend
 }
 
 func (d *AndroidDevice) ID() string {
